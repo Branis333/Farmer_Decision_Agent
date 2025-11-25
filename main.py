@@ -1,21 +1,9 @@
-"""Main runner for Pasture Allocation Optimizer.
 
-Loads a trained model (DQN/PPO/A2C/REINFORCE) and runs a single
-rendered evaluation episode to visualize agent behavior.
-
-Usage (CMD):
-	python main.py --algo dqn --render
-	python main.py --algo ppo --render --episodes 2
-	python main.py --algo reinforce --render
-
-If --render omitted, uses ansi mode.
-"""
 import argparse
 import os
 import time
 from typing import Optional
 
-import numpy as np
 import torch
 
 from environment.custom_env import PastureEnv, make_env
@@ -28,28 +16,48 @@ SB3_ALGOS = {
 
 
 def load_sb3(algo: str):
-	from stable_baselines3 import DQN, PPO, A2C  # local import to avoid hard dependency if missing
+	"""Load SB3 model and wrap it for NumPy 2.x compatibility."""
+	from stable_baselines3 import DQN, PPO, A2C
 	path, cls_name = SB3_ALGOS[algo]
 	if not os.path.exists(path):
 		raise FileNotFoundError(f"Model file not found: {path}. Train the {algo.upper()} model first.")
 	if algo == 'dqn':
-		return DQN.load(path)
-	if algo == 'ppo':
-		return PPO.load(path)
-	if algo == 'a2c':
-		return A2C.load(path)
-	raise ValueError(algo)
+		model = DQN.load(path)
+	elif algo == 'ppo':
+		model = PPO.load(path)
+	elif algo == 'a2c':
+		model = A2C.load(path)
+	else:
+		raise ValueError(algo)
+	return SB3ModelWrapper(model)
+
+
+class SB3ModelWrapper:
+	"""Wrapper to bypass NumPy 2.x compatibility issues with SB3 predict."""
+	def __init__(self, model):
+		self.model = model
+		self.policy = model.policy
+		self.device = model.device
+	
+	def predict(self, obs, deterministic=True):
+		
+		obs_list = obs.tolist() if hasattr(obs, 'tolist') else list(obs)
+		obs_tensor = torch.tensor(obs_list, dtype=torch.float32, device=self.device)
+		obs_tensor = obs_tensor.unsqueeze(0)  
+		with torch.no_grad():
+			action = self.policy._predict(obs_tensor, deterministic=deterministic)
+			return int(action.cpu().item()), None
 
 
 class LoadedReinforcePolicy(torch.nn.Module):
-	def __init__(self, hidden_size: int):
+	def __init__(self, obs_dim: int, act_dim: int, hidden_size: int):
 		super().__init__()
 		self.net = torch.nn.Sequential(
-			torch.nn.Linear(5, hidden_size),
+			torch.nn.Linear(obs_dim, hidden_size),
 			torch.nn.ReLU(),
 			torch.nn.Linear(hidden_size, hidden_size),
 			torch.nn.ReLU(),
-			torch.nn.Linear(hidden_size, 3)
+			torch.nn.Linear(hidden_size, act_dim)
 		)
 
 	def forward(self, x):
@@ -57,7 +65,10 @@ class LoadedReinforcePolicy(torch.nn.Module):
 
 	def predict(self, obs):
 		with torch.no_grad():
-			logits = self.forward(torch.from_numpy(obs).float().unsqueeze(0))
+			
+			obs_list = obs.tolist() if hasattr(obs, 'tolist') else list(obs)
+			obs_tensor = torch.tensor(obs_list, dtype=torch.float32).unsqueeze(0)
+			logits = self.forward(obs_tensor)
 			probs = torch.softmax(logits, dim=-1)
 			dist = torch.distributions.Categorical(probs)
 			return dist.sample().item()
@@ -67,9 +78,15 @@ def load_reinforce(path: str):
 	if not os.path.exists(path):
 		raise FileNotFoundError(f"REINFORCE model not found at {path}. Train it first.")
 	payload = torch.load(path, map_location='cpu')
-	hidden_size = payload['config']['hidden_size']
-	policy = LoadedReinforcePolicy(hidden_size)
-	policy.load_state_dict(payload['state_dict'])
+	state = payload['state_dict']
+	
+	first_w = state['net.0.weight'] 
+	last_w = state['net.4.weight']   
+	hidden_size = first_w.shape[0]
+	obs_dim = first_w.shape[1]
+	act_dim = last_w.shape[0]
+	policy = LoadedReinforcePolicy(obs_dim, act_dim, hidden_size)
+	policy.load_state_dict(state)
 	policy.eval()
 	return policy
 
@@ -115,7 +132,9 @@ def run_episode(model, render: bool, algo: str, delay: float, fps: int, hold: fl
 		total_reward += r
 		done = terminated or truncated
 		if not render:
-			print(f"Day={info['day']} Grass={info['grass_levels']} Hunger={info['hunger']:.2f} Reward={r:.2f}")
+			grass = info['grass_levels']
+			grass_str = f"[{grass[0]:.2f}, {grass[1]:.2f}, {grass[2]:.2f}]"
+			print(f"Day={info['day']} Grass={grass_str} Hunger={info['hunger']:.2f} Reward={r:.2f}")
 			time.sleep(delay)
 	# Hold window open for post-run viewing
 	if render and hold > 0:
@@ -155,7 +174,8 @@ def main():
 		ep_reward = run_episode(model, render=args.render, algo=args.algo, delay=args.delay, fps=args.fps, hold=args.hold if ep == args.episodes - 1 else 0.0)
 		rewards.append(ep_reward)
 		print(f"Episode {ep+1}/{args.episodes} reward={ep_reward:.2f}")
-	print(f"Average reward: {np.mean(rewards):.2f}")
+	avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
+	print(f"Average reward: {avg_reward:.2f}")
 
 
 if __name__ == '__main__':

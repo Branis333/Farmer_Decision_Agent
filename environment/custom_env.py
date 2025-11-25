@@ -8,51 +8,22 @@ from gymnasium import spaces
 
 try:
     from .rendering import PastureRenderer
-except Exception:  # pragma: no cover - allow direct script usage
+except Exception:  
     PastureRenderer = None
 
 
 class PastureEnv(gym.Env):
-    """Custom rotational grazing environment for a Farmer Decision Agent.
 
-    State vector (observation):
-        [grass_A, grass_B, grass_C, cow_hunger, day_normalized]
-        All values in [0,1]. Day normalized = current_day / max_days.
-
-    Action space (Discrete 3):
-        0 -> Graze Pasture A
-        1 -> Graze Pasture B
-        2 -> Graze Pasture C
-
-    Dynamics:
-        - Grazed pasture: grass -= depletion_rate, hunger -= feeding_amount
-        - Resting pasture: grass += regrowth_rate
-        - Hunger increases slightly each step (base_hunger_increase) then is reduced if grazed.
-        - Values are clipped to [0,1].
-
-    Reward shaping:
-        +20 if chosen pasture grass >= 0.5 (healthy grazing)
-        -15 if chosen pasture grass < 0.3 before grazing (overgrazed usage)
-        +10 if hunger reduced (i.e., previous hunger - new hunger > 0)
-        -50 if all pastures < 0.2 after update => system collapse (episode terminates)
-
-    Termination conditions:
-        - System collapse (all grass levels < 0.2) => truncated = False, terminated = True
-        - Any pasture stays below 0.1 for > collapse_patience consecutive days (terminated)
-        - Max days reached (truncated)
-
-    Additional info metrics returned in 'info':
-        grass_levels, hunger, grazing_balance (counts of each pasture chosen), day
-    """
 
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 5}
 
     def __init__(self,
                  max_days: int = 30,
-                 depletion_rate: float = 0.3,
-                 feeding_amount: float = 0.4,
-                 regrowth_rate: float = 0.1,
-                 base_hunger_increase: float = 0.05,
+                 depletion_rate: float = 0.28,
+                 feeding_amount: float = 0.25,
+                 regrowth_rate: float = 0.09,
+                 base_hunger_increase: float = 0.06,
+                 base_thirst_increase: float = 0.06,
                  collapse_patience: int = 3,
                  seed: Optional[int] = None,
                  render_mode: Optional[str] = None,
@@ -63,38 +34,45 @@ class PastureEnv(gym.Env):
         self.feeding_amount = feeding_amount
         self.regrowth_rate = regrowth_rate
         self.base_hunger_increase = base_hunger_increase
+        # Missing assignment caused AttributeError when accessing in step()
+        self.base_thirst_increase = base_thirst_increase
         self.collapse_patience = collapse_patience
         self.render_mode = render_mode
         self._rng = random.Random(seed)
         self._np_rng = np.random.default_rng(seed)
 
         # Discrete actions: choose one pasture.
-        self.action_space = spaces.Discrete(3)
-        # Observation: 5 continuous features in [0,1]
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(5,), dtype=np.float32)
+        self.action_space = spaces.Discrete(5)
+        # Observation: 11 features
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(11,), dtype=np.float32)
 
         # Internal state
         self.grass = np.array([0.7, 0.7, 0.7], dtype=np.float32)
+        self.fertility = np.array([0.7, 0.7, 0.7], dtype=np.float32)
         self.hunger: float = 0.5
+        self.thirst: float = 0.4
+        self.disease_risk: float = 0.1
+        self.rain_flag: float = 0.0
         self.day: int = 0
-        self.low_grass_streak = np.zeros(3, dtype=np.int32)  # consecutive days < 0.1 per pasture
+        self.low_grass_streak = np.zeros(3, dtype=np.int32) 
         self.grazing_counts = np.zeros(3, dtype=np.int32)
+        self.prev_action: Optional[int] = None
 
         self.renderer = None
         if self.render_mode == "human" and PastureRenderer is not None:
             self.renderer = PastureRenderer(window_width=600, window_height=400, max_fps=render_fps)
 
-    def seed(self, seed: Optional[int] = None):  # Gymnasium seeding compatibility
+    def seed(self, seed: Optional[int] = None):  
         self._rng = random.Random(seed)
         self._np_rng = np.random.default_rng(seed)
 
     def _get_obs(self) -> np.ndarray:
         day_norm = self.day / self.max_days
         return np.array([
-            self.grass[0],
-            self.grass[1],
-            self.grass[2],
-            self.hunger,
+            self.grass[0], self.grass[1], self.grass[2],
+            self.fertility[0], self.fertility[1], self.fertility[2],
+            self.hunger, self.thirst,
+            self.disease_risk, self.rain_flag,
             day_norm
         ], dtype=np.float32)
 
@@ -102,7 +80,10 @@ class PastureEnv(gym.Env):
         grazing_balance = (self.grazing_counts / max(1, np.sum(self.grazing_counts))).tolist()
         return {
             "grass_levels": self.grass.copy(),
+            "fertility": self.fertility.copy(),
             "hunger": self.hunger,
+            "thirst": self.thirst,
+            "disease_risk": self.disease_risk,
             "day": self.day,
             "grazing_balance": grazing_balance,
         }
@@ -111,10 +92,15 @@ class PastureEnv(gym.Env):
         if seed is not None:
             self.seed(seed)
         self.grass = np.array([0.7, 0.7, 0.7], dtype=np.float32)
+        self.fertility[:] = 0.7
         self.hunger = 0.5
+        self.thirst = 0.4
+        self.disease_risk = 0.1
+        self.rain_flag = 0.0
         self.day = 0
         self.low_grass_streak[:] = 0
         self.grazing_counts[:] = 0
+        self.prev_action = None
         obs = self._get_obs()
         info = self._get_info()
         if self.renderer:
@@ -125,36 +111,87 @@ class PastureEnv(gym.Env):
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         assert self.action_space.contains(action), f"Invalid action {action}"
         prev_hunger = self.hunger
+        prev_thirst = self.thirst
 
-        # Apply grazing to chosen pasture
-        chosen_grass_before = float(self.grass[action])
+        # Weather/seasonality
+        season = 0.5 + 0.5 * math.sin(2 * math.pi * (self.day % 30) / 30.0)
+        p_rain = 0.2 + 0.3 * season
+        self.rain_flag = 1.0 if self._np_rng.random() < p_rain else 0.0
+
+        # Apply dynamics
+        chosen_grass_before = float(self.grass[action]) if action in (0,1,2) else 0.0
         reward = 0.0
 
         # Reward component: healthy vs overgrazed BEFORE depletion
-        if chosen_grass_before >= 0.5:
-            reward += 20.0
-        elif chosen_grass_before < 0.3:
-            reward -= 15.0
+        if action in (0,1,2):
+            if chosen_grass_before >= 0.5:
+                reward += 10.0
+            elif chosen_grass_before < 0.3:
+                reward -= 20.0
 
-        # Grazing effect
-        self.grass[action] -= self.depletion_rate
-        self.hunger -= self.feeding_amount
-
-        # Resting pastures regrow
-        for i in range(3):
-            if i != action:
-                self.grass[i] += self.regrowth_rate
-
-        # Base hunger natural increase (cows get hungry over time)
+        # Base hunger/thirst increases first
         self.hunger += self.base_hunger_increase
+        self.thirst += self.base_thirst_increase
+
+        # Action effects
+        if action in (0,1,2):
+            # Grazing
+            self.grass[action] -= self.depletion_rate
+            # Feeding efficiency scales with available grass and disease
+            feeding_eff = self.feeding_amount * chosen_grass_before * (1.0 - 0.5 * self.disease_risk)
+            self.hunger -= feeding_eff
+            # Activity increases thirst a bit
+            self.thirst += 0.03
+        elif action == 3:
+            # Rest day: stronger regrowth bonus and fertility recovery, but cows get hungrier
+            self.hunger += 0.03
+            self.thirst -= 0.02
+            self.fertility += 0.03
+        elif action == 4:
+            # Water action: reduce thirst significantly, slight hunger increase
+            self.thirst -= 0.3
+            self.hunger += 0.02
+
+        # Resting pasture regrowth
+        for i in range(3):
+            rain_mult = (1.0 + 0.5 * self.rain_flag)
+            base_growth = self.regrowth_rate * self.fertility[i] * rain_mult
+            if action in (0,1,2) and i == action:
+                # No regrowth on grazed patch
+                pass
+            else:
+                self.grass[i] += base_growth
+                # Fertility gentle recovery when resting
+                self.fertility[i] += 0.01
+
+        # Fertility loss on overgrazing or repeated grazing
+        if action in (0,1,2):
+            if chosen_grass_before < 0.3:
+                self.fertility[action] -= 0.05
+                self.disease_risk += 0.05
+            if self.prev_action == action:
+                self.disease_risk += 0.03
+        else:
+            # decay disease slowly when not grazing
+            self.disease_risk -= 0.02
+
+        # Hunger/thirst/disease penalty shaping
+        hunger_drop = max(-1.0, min(1.0, prev_hunger - self.hunger))
+        thirst_drop = max(-1.0, min(1.0, prev_thirst - self.thirst))
+        reward += 20.0 * hunger_drop + 15.0 * thirst_drop
+        if self.hunger > 0.7:
+            reward -= 5.0
+        if self.thirst > 0.7:
+            reward -= 5.0
+        if self.disease_risk > 0.6:
+            reward -= 10.0
 
         # Clip values
         self.grass = np.clip(self.grass, 0.0, 1.0)
+        self.fertility = np.clip(self.fertility, 0.1, 1.0)
         self.hunger = float(np.clip(self.hunger, 0.0, 1.0))
-
-        # Hunger improvement reward
-        if prev_hunger - self.hunger > 0:  # hunger decreased
-            reward += 10.0
+        self.thirst = float(np.clip(self.thirst, 0.0, 1.0))
+        self.disease_risk = float(np.clip(self.disease_risk, 0.0, 1.0))
 
         # Update streaks for collapse condition
         for i in range(3):
@@ -163,22 +200,24 @@ class PastureEnv(gym.Env):
             else:
                 self.low_grass_streak[i] = 0
 
-        # Count grazing for balance metric
-        self.grazing_counts[action] += 1
+        # Count only actual grazing actions (0,1,2) for balance metric
+        if action in (0, 1, 2):
+            self.grazing_counts[action] += 1
+        self.prev_action = action
 
         # Check collapse (all low) AFTER updates
-        if np.all(self.grass < 0.2):
-            reward -= 50.0
+        if np.all(self.grass < 0.15):
+            reward -= 60.0
             terminated = True
             truncated = False
-        elif np.any(self.low_grass_streak > self.collapse_patience):
+        elif np.any(self.low_grass_streak > self.collapse_patience) or self.hunger >= 0.95 or self.thirst >= 0.95:
             # Pasture failed to recover
-            reward -= 50.0
+            reward -= 60.0
             terminated = True
             truncated = False
         else:
             terminated = False
-            truncated = (self.day + 1) >= self.max_days
+            truncated = (self.day + 1) >= max(self.max_days, 45)
 
         self.day += 1
 
@@ -186,7 +225,12 @@ class PastureEnv(gym.Env):
         info = self._get_info()
 
         if self.renderer:
-            self.renderer.draw(self.grass, self.hunger, self.day, last_action=action, reward=reward)
+            self.renderer.draw(
+                self.grass, self.hunger, self.day,
+                last_action=action, reward=reward,
+                fert_levels=self.fertility, thirst=self.thirst,
+                disease_risk=self.disease_risk, rain_flag=self.rain_flag
+            )
 
         return obs, reward, terminated, truncated, info
 

@@ -57,7 +57,7 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    # Hyperparameter grid (ensure >=10 combinations)
+    # Hyperparameter grid 
     grid = {
         'learning_rate': [1e-3, 5e-4],
         'gamma': [0.95, 0.99],
@@ -69,16 +69,16 @@ def main():
         'exploration_initial_eps': [1.0],
         'exploration_final_eps': [0.05],
     }
-    # Build combinations
+    
     keys = list(grid.keys())
     combos = []
     for values in product(*[grid[k] for k in keys]):
         combo = dict(zip(keys, values))
         combo['tb_log'] = None
         combos.append(combo)
-    # Guarantee at least args.runs
+    
     if len(combos) < args.runs:
-        # Duplicate some combos with slight modifications (e.g., gamma tweak)
+        
         while len(combos) < args.runs:
             mod = combos[-1].copy()
             mod['gamma'] = 0.9 if mod['gamma'] != 0.9 else 0.99

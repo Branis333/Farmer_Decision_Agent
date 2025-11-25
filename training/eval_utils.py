@@ -13,6 +13,8 @@ def evaluate_policy(env_fn, model, episodes: int = 5) -> Dict[str, Any]:
     rewards = []
     lengths = []
     balances = []
+    avg_hunger = []
+    avg_thirst = []
 
     for _ in range(episodes):
         env = env_fn()
@@ -20,6 +22,8 @@ def evaluate_policy(env_fn, model, episodes: int = 5) -> Dict[str, Any]:
         done = False
         ep_reward = 0.0
         steps = 0
+        step_h = []
+        step_t = []
         while not done:
             action = None
             if hasattr(model, 'predict'):
@@ -36,7 +40,7 @@ def evaluate_policy(env_fn, model, episodes: int = 5) -> Dict[str, Any]:
                 else:
                     action = pred
             else:
-                # Fallback: direct act method if available
+                
                 if hasattr(model, 'act'):
                     action = model.act(obs)
                 else:
@@ -46,9 +50,15 @@ def evaluate_policy(env_fn, model, episodes: int = 5) -> Dict[str, Any]:
             ep_reward += r
             steps += 1
             done = terminated or truncated
+            step_h.append(info.get('hunger', 0.0))
+            step_t.append(info.get('thirst', 0.0))
         rewards.append(ep_reward)
         lengths.append(steps)
         balances.append(info['grazing_balance'])
+        if step_h:
+            avg_hunger.append(float(np.mean(step_h)))
+        if step_t:
+            avg_thirst.append(float(np.mean(step_t)))
         env.close()
 
     rewards_arr = np.array(rewards)
@@ -59,4 +69,6 @@ def evaluate_policy(env_fn, model, episodes: int = 5) -> Dict[str, Any]:
         'std_reward': float(rewards_arr.std()),
         'avg_length': float(lengths_arr.mean()),
         'grazing_balance_mean': balances_arr.mean(axis=0).tolist(),
+        'mean_hunger': float(np.mean(avg_hunger)) if avg_hunger else None,
+        'mean_thirst': float(np.mean(avg_thirst)) if avg_thirst else None,
     }

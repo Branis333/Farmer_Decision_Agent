@@ -27,16 +27,16 @@ def run_random(episodes: int, render: bool, fps: int, hold: float):
             ep_reward += r
             done = terminated or truncated
             if not render:
-                # Brief pause to observe ansi output progression
-                print(f"Step day={info['day']} grass={info['grass_levels']} hunger={info['hunger']:.2f} reward={r:.2f}")
+               
+                print(f"Step day={info['day']} grass={info['grass_levels']} fert={info.get('fertility')} hunger={info['hunger']:.2f} thirst={info.get('thirst',0):.2f} reward={r:.2f}")
                 time.sleep(0.05)
         rewards.append(ep_reward)
         print(f"Episode {ep+1}/{episodes} random policy total reward={ep_reward:.2f}")
         if render and hold > 0:
-            # keep window open for hold seconds
+            
             t_end = time.time() + hold
             while time.time() < t_end:
-                # pump events so OS stays responsive
+               
                 for event in env.renderer and [] or []:
                     pass
                 time.sleep(0.05)

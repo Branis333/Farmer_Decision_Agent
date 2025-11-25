@@ -1,0 +1,6 @@
+{
+  "algo": "PPO",
+  "seed": 42,
+  "env": "PastureEnv",
+  "timestamp": "2025-11-24 11:06:34"
+}

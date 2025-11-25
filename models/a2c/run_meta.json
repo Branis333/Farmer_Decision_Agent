@@ -1,0 +1,6 @@
+{
+  "algo": "A2C",
+  "seed": 32,
+  "env": "PastureEnv",
+  "timestamp": "2025-11-24 11:08:42"
+}
